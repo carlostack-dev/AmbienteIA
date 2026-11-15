@@ -1,0 +1,18 @@
+# Hermes Agent CLI Configuration — EXEMPLO (template)
+# Copie este arquivo para config.yaml e ajuste conforme necessario.
+# NUNCA publique o config.yaml real contendo chaves ou caminhos privados.
+
+# Versao do esquema do arquivo
+_config_version: 53
+
+# Banco de dados
+database:
+  journal_mode: "wal"
+
+# Limites de tempo de execucao
+runtime:
+  nofile_soft_limit: 4096
+  malloc_arena_max: 4
+
+# Anexo de sessoes
+# O Hermes gerencia este arquivo: nao copie para outro perfil.

@@ -1,0 +1,91 @@
+# AmbienteIA — .gitignore
+# Projeto: Central de Controle do Ambiente Local de Agentes IA (Windows 11)
+# PowerShell + WPF
+
+# =============================================================================
+# AmbienteIA — especificos do projeto
+# =============================================================================
+
+# Logs gerados pelo aplicacao (contem dados de execucao e possivelmente caminhos locais)
+Logs/
+*.log
+!Logs/.gitkeep
+
+# Ticks de depuracao temporarios
+tick-debug.log
+
+# Assets gerados ou em cache
+*.png.cache
+*.ico.cache
+
+# Arquivos temporarios e de scratch
+*.tmp
+*.temp
+~$*
+
+# Backup local (nao publicar copias do projeto anterior)
+Backup/
+
+# =============================================================================
+# Windows
+# =============================================================================
+
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# =============================================================================
+# PowerShell
+# =============================================================================
+
+# Modulos e cache do PowerShell
+*.ps1cache
+ModuleAnalysisCache/
+
+# Historico do PowerShell (se houver)
+*_history.txt
+PSReadLine/
+
+# =============================================================================
+# Python / Hermes (ambiente local, nao publicar)
+# =============================================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# =============================================================================
+# IDEs e editores
+# =============================================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# Sistema operacional
+# =============================================================================
+
+.DS_Store
+.Spotlight-V100
+.Trashes
