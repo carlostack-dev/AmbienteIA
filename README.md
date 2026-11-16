@@ -33,7 +33,7 @@ AmbienteIA/
 ├── .env.example                 # Template de variáveis de ambiente
 ├── .gitignore                   # Arquivos ignorados pelo Git
 ├── README.md                    # Este arquivo
-├── LICENSE                      # (a adicionar)
+├── LICENSE                      # Licença MIT (incluída)
 ├── Core/
 │   └── Ambiente-IA.Core.ps1     # Lógica compartilhada (healthchecks, início, diagnóstico, stats)
 ├── Interface/
@@ -75,7 +75,7 @@ AmbienteIA/
 
 ## 4. Funcionalidades
 
-### Botões (10 no total)
+### Botões (11 no total)
 
 1. **INICIAR AMBIENTE** — Verifica Headroom, inicia o proxy se necessário, carrega `NVIDIA_API_KEY` do `.env` sem exibi-la, valida `/livez`, configura `NVIDIA_BASE_URL`, abre o Hermes, evita processos duplicados.
 2. **PARAR** — Encerra apenas processos iniciados pelo AmbienteIA (rastreados por PID).
@@ -87,7 +87,7 @@ AmbienteIA/
 8. **ATUALIZAR ESTATS** — Força atualização das estatísticas do `/stats`.
 9. **LOGS** — Abre a pasta de logs no Explorer.
 10. **CONFIG HERMES** — Abre `config.yaml` do Hermes no Bloco de Notas.
-11. **ENCERRAR INTERFACE** — Fecha apenas a janela (serviços continuam rodando).
+11. **ENCERRAR INTERFACE** — Fecha a interface e encerra os serviços do AmbienteIA (Headroom e Hermes), evitando processos órfãos.
 
 ### Monitoramento
 
@@ -113,6 +113,16 @@ Verifica:
 - Permissões e diretórios necessários
 
 Não altera configurações automaticamente.
+
+---
+
+## 4.1. Melhorias recentes (versão em preparação)
+
+- **Encerramento seguro da interface**: ao fechar a janela (botão ENCERRAR INTERFACE ou `X`), o AmbienteIA encerra os serviços que iniciou (Headroom e Hermes), evitando processos órfãos. Antes, os serviços ficavam rodando em segundo plano.
+- **Gerenciamento robusto de processos**: rastreamento de PIDs compartilhado entre runspaces, encerramento ordenado (CloseMainWindow → espera → Kill), detecção de processos filhos via WMI e camada adicional por título de janela.
+- **Carregamento de credenciais do .env**: `NVIDIA_API_KEY` é lida do `.env` do Hermes sem ser exibida nem gravada em logs; `OPENAI_API_KEY` e `HERMES_HOME` são configuradas automaticamente.
+- **Detecção de Python com Headroom**: ignora stubs da Microsoft Store e localiza o interpretador com `headroom.cli proxy` funcional (incluindo ambientes pipx/uv).
+- **Headroom com provider NVIDIA NIM**: subcomando atualizado com `--port 8787 --mode cache --openai-api-url --provider-name "NVIDIA NIM"`.
 
 ---
 

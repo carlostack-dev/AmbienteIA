@@ -89,3 +89,8 @@ coverage.xml
 .DS_Store
 .Spotlight-V100
 .Trashes
+# Credenciais e configuracao reais (nunca publicar)
+.env
+.env.*
+! .env.example
+config.yaml

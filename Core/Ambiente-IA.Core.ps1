@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # ==============================================================================
 # Ambiente-IA.Core.ps1
 # Biblioteca COMPARTILHADA do projeto AmbienteIA (somente funcoes).
@@ -23,7 +23,7 @@ $global:AiCfg = @{
     HeadroomPort           = 8787
     HeadroomBaseUrl        = 'http://127.0.0.1:8787'
     HeadroomPythonManual   = ''     # Opcional: caminho manual para o python.exe com Headroom
-    HeadroomSubcommand     = '-m headroom.cli proxy'
+    HeadroomSubcommand     = '-m headroom.cli proxy --port 8787 --mode cache --openai-api-url "https://integrate.api.nvidia.com/v1" --provider-name "NVIDIA NIM"'
     HeadroomTimeoutSec     = 45
     HeadroomExpectedVersion = '0.44.0'
 
@@ -99,6 +99,64 @@ function Test-True {
     return ($a.Count -gt 0 -and $a[$a.Count - 1] -eq $true)
 }
 
+# ------------------------------------------------------------------------------
+# CARREGAMENTO DE CREDENCIAIS DO .ENV (sem exposicao de segredos)
+# ------------------------------------------------------------------------------
+function Load-EnvFile {
+    param([string]$EnvPath)
+    if ([string]::IsNullOrWhiteSpace($EnvPath)) { return @{} }
+    if (-not (Test-Path -LiteralPath $EnvPath -PathType Leaf)) { return @{} }
+
+    $vars = @{}
+    try {
+        $content = [System.IO.File]::ReadAllLines($EnvPath, [System.Text.Encoding]::UTF8)
+        foreach ($line in $content) {
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
+            if ($trimmed -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
+                $key = $matches[1]
+                $value = $matches[2]
+                # Remover aspas ao redor do valor
+                if ($value -match '^"(.*)"$') { $value = $matches[1] }
+                elseif ($value -match "''(.*)''") { $value = $matches[1] }
+                $vars[$key] = $value
+            }
+        }
+    } catch {
+        Write-AppLog 'WARN' "Nao foi possivel ler o arquivo .env: $EnvPath"
+    }
+    return $vars
+}
+
+function Set-AiEnvironmentVariables {
+    $c = $global:AiCfg
+
+    # 1. Carregar .env do Hermes (fonte de verdade da NVIDIA_API_KEY)
+    $envVars = Load-EnvFile -EnvPath $c.HermesEnvPath
+
+    if ($envVars.ContainsKey('NVIDIA_API_KEY')) {
+        $env:NVIDIA_API_KEY = $envVars['NVIDIA_API_KEY']
+        Write-AppLog 'OK' 'NVIDIA_API_KEY carregada do .env (valor mascarado nos logs).'
+    } else {
+        Write-AppLog 'WARN' 'NVIDIA_API_KEY nao encontrada no .env do Hermes.'
+    }
+
+    # 2. OPENAI_API_KEY recebe o valor de NVIDIA_API_KEY para compatibilidade com o proxy
+    if ($env:NVIDIA_API_KEY) {
+        $env:OPENAI_API_KEY = $env:NVIDIA_API_KEY
+        Write-AppLog 'OK' 'OPENAI_API_KEY definida a partir de NVIDIA_API_KEY.'
+    }
+
+    # 3. HERMES_HOME para o Hermes Agent (raiz da instalacao, nao a pasta bin/)
+    $hermesHome = Split-Path -Parent $c.HermesEnvPath
+    if (Test-Path -LiteralPath $hermesHome -PathType Container) {
+        $env:HERMES_HOME = $hermesHome
+        Write-AppLog 'OK' "HERMES_HOME definido: $hermesHome"
+    } else {
+        Write-AppLog 'WARN' "Diretorio HERMES_HOME nao encontrado: $hermesHome"
+    }
+}
+
 function Test-AdminContext {
     try {
         $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -167,7 +225,7 @@ function Invoke-HttpProbe {
         $r.Body = $body
     } catch { }
     finally {
-        $resp.Close()
+        if ($null -ne $resp) { $resp.Close() }
     }
     return $r
 }
@@ -418,7 +476,18 @@ function Resolve-HeadroomPython {
 # DETECCAO DE PROCESSOS (evita instancias duplicadas)
 # ------------------------------------------------------------------------------
 function Get-HermesProcess {
-    return @(Get-Process -Name 'hermes' -ErrorAction SilentlyContinue)
+    # Procura por hermes.exe direto e por python.exe rodando o wrapper do Headroom
+    $procs = @(Get-Process -Name 'hermes' -ErrorAction SilentlyContinue)
+    try {
+        $wrapProcs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name LIKE 'python%'" -ErrorAction Stop |
+            Where-Object {
+                $_.CommandLine -and $_.CommandLine -like '*headroom.cli*wrap*hermes*'
+            })
+        foreach ($p in $wrapProcs) {
+            if ($procs -notcontains $p) { $procs += $p }
+        }
+    } catch { }
+    return $procs
 }
 
 function Get-HeadroomProcess {
@@ -436,22 +505,475 @@ function Get-HeadroomProcess {
 }
 
 # Processos iniciados pelo AmbienteIA (rastreados por PID)
-$script:AiManagedPids = @()
+# LISTA COMPARTILHADA ENTRE RUNARSPACES: a GUI roda no runspace principal e
+# Start-AiEnvironment roda em um runspace de background (Start-BackgroundWork).
+# O escopo $script: e' isolado por runspace, entao os PIDs registrados no
+# background nunca seriam vistos pela GUI. Usamos $global: com uma Lista
+# tipada, que e' a mesma instancia em ambos os runspaces (passada via
+# SessionStateProxy.SetVariable em New-BackgroundRunspace).
+if (-not ($global:AiManagedPids -is [System.Collections.Generic.List[int]])) {
+    $global:AiManagedPids = [System.Collections.Generic.List[int]]::new()
+}
+
+# Identificador unico da sessao atual da interface. Usado para nao confundir
+# processos de sessoes anteriores com o da sessao em execucao.
+if (-not ($global:AiSessionId -is [string] -and -not [string]::IsNullOrWhiteSpace($global:AiSessionId))) {
+    $global:AiSessionId = [Guid]::NewGuid().ToString('N')
+}
+
+# Metadados compartilhados entre runspaces: PID -> { CommandLine, CreateTime, ParentPid, Executable, Kind }.
+# Permite validar propriedade do processo (evitar PID reutilizado pelo Windows)
+# e encerrar a arvore completa de descendentes ao parar o ambiente.
+if (-not ($global:AiManagedProcessMeta -is [System.Collections.Hashtable])) {
+    $global:AiManagedProcessMeta = [System.Collections.Hashtable]::Synchronized([System.Collections.Hashtable]::new())
+}
+
+# Arvore de parentesco: PaiPid -> Lista[int] de PIDs filhos diretos.
+# Preenchido ao lançar janelas e ao mapear descendentes existentes.
+if (-not ($global:AiProcessTree -is [System.Collections.Hashtable])) {
+    $global:AiProcessTree = [System.Collections.Hashtable]::Synchronized([System.Collections.Hashtable]::new())
+}
+
+# ------------------------------------------------------------------------------
+# REGISTRO PERSISTENTE DE PROCESSOS (recuperacao apos encerramento abrupto)
+# ------------------------------------------------------------------------------
+# Arquivo JSON que persiste os metadados dos processos iniciados pelo
+# AmbienteIA. Permite recuperar processos órfãos de sessoes anteriores mesmo
+# quando a interface foi encerrada abruptamente (sem passar por Stop-AiEnvironment).
+if (-not ($script:AiRegisteredProcessesFile -is [string] -and -not [string]::IsNullOrWhiteSpace($script:AiRegisteredProcessesFile))) {
+    $script:AiRegisteredProcessesFile = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'AmbienteIA\hermes\ai_registered_processes.json'
+}
+
+function Save-RegisteredProcessesToDisk {
+    try {
+        $snapshot = [System.Collections.Generic.List[object]]::new()
+        foreach ($managedPid in @($global:AiManagedPids)) {
+            if ($global:AiManagedProcessMeta.ContainsKey($managedPid)) {
+                $meta = $global:AiManagedProcessMeta[$managedPid]
+                # Serializa CreateTime como string ISO 8601 para evitar o formato
+                # \/Date(...)\/ do ConvertTo-Json, nao suportado pelo
+                # ConvertFrom-Json do PowerShell 5.1.
+                $entry = [ordered]@{
+                    Pid           = $meta.Pid
+                    CommandLine   = [string]$meta.CommandLine
+                    CreateTime    = if ($meta.CreateTime -is [datetime]) {
+                        ([datetime]$meta.CreateTime).ToString('o')
+                    } else {
+                        [string]$meta.CreateTime
+                    }
+                    ParentPid     = $meta.ParentPid
+                    Executable    = [string]$meta.Executable
+                    Kind          = [string]$meta.Kind
+                    SessionId     = [string]$meta.SessionId
+                }
+                $snapshot.Add($entry)
+            }
+        }
+        $json = $snapshot | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText($script:AiRegisteredProcessesFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-AppLog 'WARN' "Nao foi possivel salvar o registro persistente de processos: $($_.Exception.Message)"
+    }
+}
+
+function Load-RegisteredProcessesFromDisk {
+    if (-not (Test-Path -LiteralPath $script:AiRegisteredProcessesFile -PathType Leaf)) { 
+        Write-Host "[DEBUG Load] Arquivo nao encontrado" -ForegroundColor Yellow
+        return @() 
+    }
+    try {
+        $content = [System.IO.File]::ReadAllText($script:AiRegisteredProcessesFile, (New-Object System.Text.UTF8Encoding($false)))
+        $data = $content | ConvertFrom-Json
+        if ($null -eq $data) { 
+            Write-Host "[DEBUG Load] data e null" -ForegroundColor Yellow
+            return @() 
+        }
+        # Garante que retorne sempre um array (ConvertFrom-Json retorna objeto unico com 1 item).
+        $arr = @($data)
+        Write-Host "[DEBUG Load] arr.Count=$($arr.Count)" -ForegroundColor Yellow
+        return $arr
+    } catch {
+        Write-AppLog 'WARN' "Nao foi possível carregar o registro persistente de processos: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+# Retorna processos registrados em disco que pertencem a SESSOES ANTERIORES
+# (SessionId diferente da atual) e que ainda existem no SO.
+# Usado apenas para identificacao segura de órfãos; nao encerra por si so.
+function Get-RegisteredProcessesFromPriorSessions {
+    $prior = @()
+    foreach ($entry in Load-RegisteredProcessesFromDisk) {
+        try {
+            $managedPid = [int]$entry.Pid
+            if ($managedPid -le 0) { continue }
+            # So considera sessao anterior se o SessionId for diferente da atual.
+            if ([string]$entry.SessionId -eq $global:AiSessionId) { continue }
+            $p = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
+            if ($null -eq $p) { continue }
+            # Valida identidade antes de considerar como pertencente a sessao anterior.
+            $ct = [datetime]$entry.CreateTime
+            if ($ct -ne $p.StartTime) { continue }
+            $exeName = Split-Path -Leaf $p.Path
+            $regExe = [string]$entry.Executable
+            if (-not [string]::IsNullOrWhiteSpace($regExe) -and $exeName -ne (Split-Path -Leaf $regExe)) { continue }
+            $prior += [pscustomobject]@{
+                Pid           = $managedPid
+                CommandLine   = [string]$entry.CommandLine
+                CreateTime    = $ct
+                ParentPid     = [int]$entry.ParentPid
+                Executable    = [string]$entry.Executable
+                Kind          = [string]$entry.Kind
+                SessionId     = [string]$entry.SessionId
+                Process       = $p
+            }
+        } catch { }
+    }
+    return $prior
+}
+
+function Remove-RegisteredProcess {
+    param([int]$ProcessId)
+    if ($global:AiManagedPids.Contains($ProcessId)) {
+        $global:AiManagedPids.Remove($ProcessId)
+    }
+    if ($global:AiManagedProcessMeta.Contains($ProcessId)) {
+        $global:AiManagedProcessMeta.Remove($ProcessId)
+    }
+    Save-RegisteredProcessesToDisk
+}
 
 function Register-ManagedProcess {
-    param([int]$Pid)
-    if ($Pid -gt 0) { $script:AiManagedPids += $Pid }
+    param(
+        [int]$processId,
+        [string]$CommandLine,
+        [datetime]$CreateTime,
+        [int]$ParentPid,
+        [string]$Executable,
+        [string]$Kind
+    )
+    if ($processId -le 0) { return }
+    if (-not $global:AiManagedPids.Contains($processId)) {
+        $global:AiManagedPids.Add($processId)
+    }
+    $meta = [ordered]@{
+        Pid           = $processId
+        CommandLine   = $CommandLine
+        CreateTime    = $CreateTime
+        ParentPid     = $ParentPid
+        Executable    = $Executable
+        Kind          = $Kind
+        SessionId     = $global:AiSessionId
+    }
+    $global:AiManagedProcessMeta[$processId] = $meta
+    if ($ParentPid -gt 0) {
+        if (-not $global:AiProcessTree.ContainsKey($ParentPid)) {
+            $global:AiProcessTree[$ParentPid] = [System.Collections.Generic.List[int]]::new()
+        }
+        $children = $global:AiProcessTree[$ParentPid]
+        if (-not $children.Contains($processId)) { $children.Add($processId) }
+    }
+    # Persiste o registro para recuperacao apos encerramento abrupto.
+    Save-RegisteredProcessesToDisk
 }
 
 function Get-ManagedProcesses {
     $alive = @()
-    foreach ($pid in $script:AiManagedPids) {
+    # Snapshot: evita enumerar a lista compartilhada enquanto outro runspace a altera.
+    foreach ($processId in @($global:AiManagedPids)) {
         try {
-            $p = Get-Process -Id $pid -ErrorAction SilentlyContinue
+            $p = Get-Process -Id $processId -ErrorAction SilentlyContinue
             if ($null -ne $p) { $alive += $p }
         } catch { }
     }
     return $alive
+}
+
+# ------------------------------------------------------------------------------
+# DESCOBERTA DE PROCESSOS FILHOS E POR TÍTULO DE JANELA
+# ------------------------------------------------------------------------------
+# Encontra processos filhos de um PID pai usando WMI (Win32_Process).
+# Isso permite encerrar não apenas o cmd.exe pai, mas também os
+# processos python.exe (Headroom / Hermes) que ele gerou.
+function Get-ChildProcesses {
+    param([int]$ParentPid)
+    $children = @()
+    try {
+        $wmiProcs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Where-Object { $_.ParentProcessId -eq $ParentPid })
+        foreach ($c in $wmiProcs) {
+            try {
+                $p = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
+                if ($null -ne $p) { $children += $p }
+            } catch { }
+        }
+    } catch { }
+    return $children
+}
+
+# ------------------------------------------------------------------------------
+# PERCURSO RECURSIVO DA ARVORE DE PROCESSOS
+# ------------------------------------------------------------------------------
+# Retorna todos os descendentes (netos, bisnetos, ...) de um PID raiz,
+# percorrendo Win32_Process ate nao ha mais filhos. Usado para encerrar a
+# arvore completa pertencente a uma janela cmd lancada pelo AmbienteIA.
+function Get-DescendantProcessesRecursive {
+    param([int]$RootPid)
+    $all = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $queue.Enqueue($RootPid)
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    try {
+        $allProcs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    } catch {
+        return $all
+    }
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        foreach ($c in $allProcs) {
+            try {
+                if ([int]$c.ParentProcessId -eq $current -and -not $seen.Contains([int]$c.ProcessId)) {
+                    $seen.Add([int]$c.ProcessId) | Out-Null
+                    $p = Get-Process -Id ([int]$c.ProcessId) -ErrorAction SilentlyContinue
+                    if ($null -ne $p) {
+                        $all.Add($p)
+                        $queue.Enqueue([int]$c.ProcessId)
+                    }
+                }
+            } catch { }
+        }
+    }
+    return $all
+}
+
+# ------------------------------------------------------------------------------
+# VALIDACAO DE PROPRIEDADE DE PROCESSO (evitar PID reutilizado)
+# ------------------------------------------------------------------------------
+# Um processo so e considerado gerenciado pela sessao atual se:
+#  1. Seu PID esta em $global:AiManagedProcessMeta;
+#  2. O CreateTime gravado coincide com o CreateTime real do processo;
+#  3. O nome do executavel gravado coincide com o nome real;
+#  4. O SessionId gravado coincide com a sessao atual.
+# Isso impede encerrar um processo alheio que reaproveitou um PID antigo.
+function Test-ProcessBelongsToCurrentSession {
+    param([int]$ProcessId)
+    if (-not $global:AiManagedProcessMeta.ContainsKey($ProcessId)) { return $false }
+    $meta = $global:AiManagedProcessMeta[$ProcessId]
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($meta.SessionId) -or $meta.SessionId -ne $global:AiSessionId) { return $false }
+        if ([datetime]$meta.CreateTime -ne $p.StartTime) { return $false }
+        $exeName = Split-Path -Leaf $p.Path
+        if (-not [string]::IsNullOrWhiteSpace($meta.Executable) -and
+            $exeName -ne (Split-Path -Leaf $meta.Executable)) { return $false }
+        return $true
+    }    catch {
+        return $false
+    }
+}
+
+# ------------------------------------------------------------------------------
+# VALIDACAO DE IDENTIDADE DE INSTANCIA DE PROCESSO (evitar PID reutilizado)
+# ------------------------------------------------------------------------------
+# Confirma que o processo com PID ainda e a mesma instancia registrada, comparando
+# CreateTime, Executable e SessionId. O PID sozinho nao e suficiente porque o
+# Windows reutiliza PIDs apos o encerramento de um processo.
+# Retorna $true somente se todos os campos esperados (nao nulos/vazios) conferem.
+function Test-ProcessIdentity {
+    param([int]$ProcessId)
+    # Lê os metadados esperados da variável de escopo, preenchida pelo chamador
+    # imediatamente antes de solicitar o encerramento. Evita passar $null para
+    # parâmetros nomeados (problema de vinculação no PowerShell 5.1).
+    $expected = $null
+    if ($script:ExpectedProcessIdentity -and $script:ExpectedProcessIdentity.Contains($ProcessId)) {
+        $expected = $script:ExpectedProcessIdentity[$ProcessId]
+    }
+    try {
+        $p = Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch {
+        # Processo nao existe mais; ja foi encerrado. Nao e uma instancia valida.
+        return $false
+    }
+
+    # 1. CreateTime deve coincidir (evita PID reutilizado por processo diferente).
+    if ($null -ne $expected -and $null -ne $expected.CreateTime) {
+        if ($p.StartTime -ne $expected.CreateTime) { return $false }
+    }
+
+    # 2. Executable deve coincidir, quando informado.
+    if ($null -ne $expected -and -not [string]::IsNullOrWhiteSpace($expected.Executable)) {
+        $exeName = Split-Path -Leaf $p.Path
+        $regExeName = Split-Path -Leaf $expected.Executable
+        if ($exeName -ne $regExeName) { return $false }
+    }
+
+    # 3. SessionId deve coincidir, quando informado. Get-Process nao expoe SessionId,
+    #    entao consultamos o WMI para esse campo especifico.
+    if ($null -ne $expected -and -not [string]::IsNullOrWhiteSpace($expected.SessionId)) {
+        try {
+            $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+            if ($null -ne $wmi -and [string]$wmi.SessionId -ne $expected.SessionId) { return $false }
+        } catch { return $false }
+    }
+
+    return $true
+}
+
+# Retorna somente os processos rastreados que ainda pertencem a esta sessao.
+function Get-ManagedProcessesCurrentSession {
+    $alive = @()
+    foreach ($processId in @($global:AiManagedPids)) {
+        if (Test-ProcessBelongsToCurrentSession -ProcessId $processId) {
+            try {
+                $p = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($null -ne $p) { $alive += $p }
+            } catch { }
+        }
+    }
+    return $alive
+}
+
+# Retorna a arvore completa (raizes rastreadas + todos os descendentes) da
+# sessao atual, sem duplicados e so com processos validados.
+function Get-ManagedProcessTree {
+    $roots = Get-ManagedProcessesCurrentSession
+    $result = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    $seen = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($r in $roots) {
+        if (-not $seen.Contains($r.Id)) { $seen.Add($r.Id) | Out-Null; $result.Add($r) }
+        $desc = Get-DescendantProcessesRecursive -RootPid $r.Id
+        foreach ($d in $desc) {
+            if (-not $seen.Contains($d.Id)) { $seen.Add($d.Id) | Out-Null; $result.Add($d) }
+        }
+    }
+    return $result
+}
+
+# Encontra processos cujo título de janela corresponde a um dos termos informados.
+# Usado como camada de seguranca adicional para localizar janelas cmd.exe do
+# Headroom ('HEADROOM - PROXY') e Hermes ('HERMES - PROJETOS') mesmo quando
+# o PID nao esta mais no rastreamento em memoria.
+function Find-ProcessesByWindowTitle {
+    param([string[]]$TitleTerms)
+    $found = @()
+    try {
+        $cmdProcs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'cmd.exe'" -ErrorAction Stop)
+        foreach ($c in $cmdProcs) {
+            $title = [string]($c.CommandLine)
+            foreach ($term in $TitleTerms) {
+                if ($title -like "*$term*") {
+                    try {
+                        $p = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
+                        if ($null -ne $p) { $found += $p }
+                    } catch { }
+                    break
+                }
+            }
+        }
+    } catch { }
+    return $found
+}
+
+# Encerra um processo individual de forma ordenada: tenta CloseMainWindow primeiro,
+# aguarda, e só então usa Kill se necessário. Retorna $true se encerrou com sucesso.
+function Stop-IndividualProcess {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$WaitMs = 5000
+    )
+    try {
+        # $PID e' variavel automática (somente leitura) do PowerShell; nunca usar $pid como variavel local.
+        $processId = $Process.Id
+        $name = $Process.ProcessName
+
+        # P6.3: Revalidar identidade da instancia antes de qualquer acao destrutiva.
+        # Nao confiar apenas no PID nem em um objeto obtido anteriormente: o Windows
+        # pode ter reutilizado o PID entre a validacao inicial e este ponto.
+        # Os metadados esperados sao lidos de $script:ExpectedProcessIdentity,
+        # preenchida pelo chamador imediatamente antes da solicitacao de encerramento.
+        $expected = $null
+        if ($script:ExpectedProcessIdentity -and $script:ExpectedProcessIdentity.Contains($processId)) {
+            $expected = $script:ExpectedProcessIdentity[$processId]
+        }
+        if ($null -ne $expected) {
+            if ($null -ne $expected.CreateTime -and $p.StartTime -ne $expected.CreateTime) {
+                Write-AppLog 'WARN' "PID $processId ($name) CreateTime divergente na revalidacao pre-encerramento; abortando."
+                return $false
+            }
+            if (-not [string]::IsNullOrWhiteSpace($expected.Executable)) {
+                $exeName = Split-Path -Leaf $p.Path
+                $regExeName = Split-Path -Leaf $expected.Executable
+                if ($exeName -ne $regExeName) {
+                    Write-AppLog 'WARN' "PID $processId ($name) Executable divergente na revalidacao pre-encerramento; abortando."
+                    return $false
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($expected.SessionId)) {
+                try {
+                    $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+                    if ($null -ne $wmi -and [string]$wmi.SessionId -ne $expected.SessionId) {
+                        Write-AppLog 'WARN' "PID $processId ($name) SessionId divergente na revalidacao pre-encerramento; abortando."
+                        return $false
+                    }
+                } catch {
+                    Write-AppLog 'WARN' "PID $processId ($name) nao foi possivel consultar WMI na revalidacao; abortando."
+                    return $false
+                }
+            }
+        }
+
+        # Primeira tentativa: fechar janela principal (envia WM_CLOSE)
+        $pClosed = $Process.CloseMainWindow()
+        if (-not $pClosed) {
+            # Sem janela principal ou não respondeu; vai direto para Kill
+            Write-AppLog 'DIAG' "Processo PID $processId ($name) sem janela principal ou CloseMainWindow falhou; usando Kill."
+        }
+        if (-not $Process.WaitForExit($WaitMs)) {
+            # Ainda vivo apos o tempo de espera; forca o encerramento.
+            # P6.3: Revalidar identidade imediatamente antes do Kill (janela de reuso de PID).
+            $expected = $null
+            if ($script:ExpectedProcessIdentity -and $script:ExpectedProcessIdentity.Contains($processId)) {
+                $expected = $script:ExpectedProcessIdentity[$processId]
+            }
+            if ($null -ne $expected) {
+                if ($null -ne $expected.CreateTime -and $p.StartTime -ne $expected.CreateTime) {
+                    Write-AppLog 'WARN' "PID $processId ($name) identidade divergente imediatamente antes do Kill; abortando."
+                    return $false
+                }
+                if (-not [string]::IsNullOrWhiteSpace($expected.Executable)) {
+                    $exeName = Split-Path -Leaf $p.Path
+                    $regExeName = Split-Path -Leaf $expected.Executable
+                    if ($exeName -ne $regExeName) {
+                        Write-AppLog 'WARN' "PID $processId ($name) identidade divergente imediatamente antes do Kill; abortando."
+                        return $false
+                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($expected.SessionId)) {
+                    try {
+                        $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+                        if ($null -ne $wmi -and [string]$wmi.SessionId -ne $expected.SessionId) {
+                            Write-AppLog 'WARN' "PID $processId ($name) identidade divergente imediatamente antes do Kill; abortando."
+                            return $false
+                        }
+                    } catch {
+                        Write-AppLog 'WARN' "PID $processId ($name) nao foi possivel consultar WMI antes do Kill; abortando."
+                        return $false
+                    }
+                }
+            }
+            $Process.Kill()
+            $Process.WaitForExit(2000)
+        }
+        if ($Process.HasExited) {
+            Write-AppLog 'OK' "Processo PID $processId ($name) encerrado."
+            return $true
+        }
+        Write-AppLog 'WARN' "Processo PID $processId ($name) ainda está em execução após tentativa de encerramento."
+        return $false
+    } catch {
+        Write-AppLog 'WARN' "Não foi possível encerrar o PID $($Process.Id): $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # ------------------------------------------------------------------------------
@@ -462,11 +984,22 @@ function Start-ManagedTerminalWindow {
         [string]$WindowTitle,
         [string]$WorkingDirectory,
         [string]$CommandLine,
-        [ValidateSet('Normal', 'Minimized', 'Hidden')][string]$WindowStyle = 'Normal'
+        [ValidateSet('Normal', 'Minimized', 'Hidden')][string]$WindowStyle = 'Normal',
+        [string]$Kind = 'terminal'
     )
     $cmdArgs = "/k title $WindowTitle && $CommandLine"
     $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdArgs -WorkingDirectory $WorkingDirectory -WindowStyle $WindowStyle -PassThru
-    Register-ManagedProcess -Pid $proc.Id
+    try {
+        $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction Stop
+        $ct = if ($null -ne $wmi -and $wmi.CreationDate) {
+            [System.Management.ManagementDateTimeConverter]::ToDateTime($wmi.CreationDate)
+        } else { $proc.StartTime }
+        $exe = Split-Path -Parent $proc.Path
+    } catch {
+        $ct = $proc.StartTime
+        $exe = $proc.Path
+    }
+    Register-ManagedProcess -processId $proc.Id -CommandLine $proc.CommandLine -CreateTime $ct -ParentPid 0 -Executable $proc.Path -Kind $Kind
     return $proc
 }
 
@@ -499,7 +1032,7 @@ function Start-HeadroomStep {
 
         $wd = $env:USERPROFILE
         if (Test-Path -LiteralPath $c.HermesWorkDir -PathType Container) { $wd = $c.HermesWorkDir }
-        $launchCmd = "echo Iniciando Headroom Proxy (upstream: $($c.NvidiaBaseUrl))... && `"$pyExe`" $($c.HeadroomSubcommand)"
+        $launchCmd = "echo Iniciando Headroom Proxy (upstream: $($c.NvidiaNimEndpoint))... && `"$pyExe`" $($c.HeadroomSubcommand)"
         try {
             Start-ManagedTerminalWindow -WindowTitle 'HEADROOM - PROXY' -WorkingDirectory $wd -CommandLine $launchCmd -WindowStyle Minimized
         } catch {
@@ -610,7 +1143,7 @@ function Start-HermesTerminal {
     }
 
     if (-not $Force) {
-        $running = @(Get-HermesProcess)
+        $running = @(Get-ManagedHermesProcesses)
         if ($running.Count -gt 0) {
             Write-AppLog 'WARN' "O Hermes ja esta em execucao (PID $($running[0].Id)). Nenhuma nova janela sera aberta."
             return $true
@@ -619,13 +1152,67 @@ function Start-HermesTerminal {
 
     $exe = $s.ExePath
     $wd = $c.HermesWorkDir
-    $launchCmd = "cd /d `"$wd`" && echo Ambiente ativo: Hermes -^> Headroom ($($c.HeadroomPort)) -^> NVIDIA NIM via $($c.NvidiaBaseUrl) && `"$exe`""
+    $launchCmd = "cd /d `"$wd`" && echo Ambiente ativo: Hermes -^> Headroom ($($c.HeadroomPort)) -^> NVIDIA NIM && python -m headroom.cli wrap hermes --no-proxy -- --provider openai"
     try {
-        Start-ManagedTerminalWindow -WindowTitle 'HERMES - PROJETOS' -WorkingDirectory $wd -CommandLine $launchCmd -WindowStyle Normal
+        $cmdProc = Start-ManagedTerminalWindow -WindowTitle 'HERMES - PROJETOS' -WorkingDirectory $wd -CommandLine $launchCmd -WindowStyle Normal -Kind 'hermes-terminal'
     } catch {
         Write-AppLog 'ERROR' "Falha ao abrir o Hermes: $($_.Exception.Message)"
         return $false
     }
+
+    # Confirmar que o Hermes realmente iniciou (aguardar o processo aparecer como descendente do CMD lancado nesta sessao).
+    # Nao usa varredura global (Get-HermesProcess): aceita somente o processo filho/descendente do cmd que este
+    # Start-HermesTerminal acabou de lancar, evitando confundir com um hermes.exe de sessao anterior.
+    $hermesProc = $null
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline -and $null -eq $hermesProc) {
+        $descendants = @(Get-DescendantProcessesRecursive -RootPid $cmdProc.Id)
+        foreach ($d in $descendants) {
+            $dName  = $d.ProcessName
+            $dCmd   = [string]$d.CommandLine
+            # Hermes e': hermes.exe OU python.exe rodando 'headroom.cli wrap hermes', e deve ser descendente do CMD lancado.
+            if (($dName -eq 'hermes') -or ($dName -like 'python*' -and $dCmd -like '*headroom.cli*wrap*hermes*')) {
+                $hermesProc = $d
+                break
+            }
+        }
+        if ($null -eq $hermesProc) {
+            Start-Sleep -Milliseconds 750
+        }
+    }
+
+    if ($null -eq $hermesProc) {
+        Write-AppLog 'WARN' 'Hermes foi lancado mas nao apareceu como descendente do CMD apos 15s. Pode ainda estar inicializando.'
+        Write-AppLog 'OK' "Hermes aberto em $wd."
+        return $true
+    }
+
+    # Registra o processo Hermes efetivamente iniciado (PID, CreateTime, Executable, ParentPid, Kind, SessionId).
+    $processId = $hermesProc.Id
+    $ct   = $hermesProc.StartTime
+    $exe  = $hermesProc.Path
+    try {
+        Register-ManagedProcess -processId $processId -CommandLine $hermesProc.CommandLine -CreateTime $ct -ParentPid $cmdProc.Id -Executable $exe -Kind 'hermes'
+
+        # Registra descendentes diretos do processo Hermes (netos do CMD), se houver.
+        $hChildren = @(Get-ChildProcesses -ParentPid $processId)
+        foreach ($hc in $hChildren) {
+            Register-ManagedProcess -processId $hc.Id -CommandLine $hc.CommandLine -CreateTime $hc.StartTime -ParentPid $processId -Executable $hc.Path -Kind 'hermes-descendant'
+        }
+    } catch {
+        Write-AppLog 'DIAG' 'Nao foi possivel registrar todos os descendentes do Hermes.'
+    }
+
+    # Confirmacao via registro da sessao atual (fonte de verdade do monitor de status).
+    $confirmed = @(Get-ManagedHermesProcesses | Where-Object { $_.Id -eq $processId })
+    if ($confirmed.Count -eq 0) {
+        Write-AppLog 'WARN' "O processo Hermes (PID $processId) nao foi reconhecido pelo registro da sessao atual."
+        Write-AppLog 'OK' "Hermes aberto em $wd."
+        return $true
+    }
+
+    # Somente depois da validacao informa o PID correto do processo desta sessao.
+    Write-AppLog 'OK' "Hermes iniciado (PID $processId)."
     Write-AppLog 'OK' "Hermes aberto em $wd."
     return $true
 }
@@ -634,22 +1221,271 @@ function Start-HermesTerminal {
 # PARADA SELETIVA DE PROCESSOS
 # ------------------------------------------------------------------------------
 function Stop-AiEnvironment {
-    # Encerra apenas processos iniciados pelo AmbienteIA (rastreados por PID).
-    $procs = Get-ManagedProcesses
-    $count = 0
-    foreach ($p in $procs) {
+    # Encerra apenas processos iniciados pelo AmbienteIA, comprovados por
+    # registro persistente (PID + CreateTime + Executable + SessionId).
+    # Nunca encerra por nome (hermes.exe, python.exe), titulo de janela ou
+    # argumento --provider openai isoladamente. Nao encerra o Hermes Gateway.
+    # Ordem: descendentes primeiro, depois raizes (cmd.exe).
+    $stoppedCount = 0
+    $stoppedFail  = 0
+    $failedPids   = @()
+    # Hashtable de escopo: PID -> {CreateTime, Executable, SessionId} esperados.
+    # Usada por Stop-IndividualProcess para revalidar identidade antes de encerrar.
+    $script:ExpectedProcessIdentity = New-Object System.Collections.Hashtable
+
+    Write-AppLog 'INFO' 'Iniciando parada seletiva do ambiente...'
+
+    # ------------------------------------------------------------------
+    # 1. Processos da sessao atual (registro em memoria)
+    # ------------------------------------------------------------------
+    $currentTree = Get-ManagedProcessTree
+    Write-AppLog 'INFO' "Processos da arvore da sessao atual: $($currentTree.Count)"
+
+    $rootIds = @($global:AiManagedPids | Where-Object { Test-ProcessBelongsToCurrentSession -ProcessId $_ })
+
+    # Encerra descendentes (nao-raizes) primeiro.
+    foreach ($p in $currentTree) {
+        if ($rootIds -contains $p.Id) { continue }
+        # Validacao imediata de propriedade antes de encerrar.
+        if (-not (Test-ProcessBelongsToCurrentSession -ProcessId $p.Id)) {
+            Write-AppLog 'DIAG' "PID $($p.Id) nao pertence a esta sessao; pulando."
+            continue
+        }
+        Write-AppLog 'INFO' "Encerrando descendente (PID $($p.Id), $($p.ProcessName))."
+        if (Stop-IndividualProcess -Process $p -WaitMs 3000) { $stoppedCount++ }
+        else { $stoppedFail++; $failedPids += $p.Id }
+    }
+
+    # Encerra raizes (cmd.exe) apos os descendentes.
+    foreach ($managedPid in @($rootIds)) {
         try {
-            Write-AppLog 'INFO' "Encerrando processo gerenciado (PID $($p.Id), $($p.ProcessName))."
-            $p.CloseMainWindow()
-            if (-not $p.WaitForExit(5000)) { $p.Kill() }
-            $count++
+            $p = Get-Process -Id $managedPid -ErrorAction Stop
         } catch {
-            Write-AppLog 'WARN' "Nao foi possivel encerrar o PID $($p.Id): $($_.Exception.Message)"
+            # Ja nao existe mais.
+            continue
+        }
+        # Validacao imediata de propriedade antes de encerrar.
+        if (-not (Test-ProcessBelongsToCurrentSession -ProcessId $managedPid)) {
+            Write-AppLog 'DIAG' "PID $managedPid nao pertence a esta sessao; pulando."
+            continue
+        }
+        Write-AppLog 'INFO' "Encerrando raiz (PID $($p.Id), $($p.ProcessName))."
+        if (Stop-IndividualProcess -Process $p -WaitMs 5000) { $stoppedCount++ }
+        else { $stoppedFail++; $failedPids += $p.Id }
+    }
+
+    # ------------------------------------------------------------------
+    # 2. Processos órfãos de sessoes anteriores (registro persistente em disco)
+    # ------------------------------------------------------------------
+    $priorSessions = Get-RegisteredProcessesFromPriorSessions
+    Write-AppLog 'INFO' "Processos registrados de sessoes anteriores ainda ativos: $($priorSessions.Count)"
+
+    foreach ($entry in $priorSessions) {
+        $managedPid = $entry.Pid
+        # Ignora se ja pertence a esta sessao (ja encerrado acima).
+        if ($rootIds -contains $managedPid) { continue }
+
+        # Validacao imediata e rigorosa: PID, CreateTime e Executable devem coincidir.
+        $belongs = $false
+        try {
+            $p = Get-Process -Id $managedPid -ErrorAction Stop
+            $ct = [datetime]$entry.CreateTime
+            $exeName = Split-Path -Leaf $p.Path
+            $regExe = [string]$entry.Executable
+            if ($ct -eq $p.StartTime) {
+                if ([string]::IsNullOrWhiteSpace($regExe) -or $exeName -eq (Split-Path -Leaf $regExe)) {
+                    $belongs = $true
+                }
+            }
+        } catch {
+            # Processo nao existe mais; ja foi encerrado.
+            continue
+        }
+
+        if (-not $belongs) {
+            Write-AppLog 'DIAG' "PID $managedPid nao validado como orfao de sessao anterior; pulando."
+            continue
+        }
+
+        Write-AppLog 'INFO' "Processo orfao de sessao anterior validado (PID $managedPid, $($entry.Process.ProcessName), comando: $($entry.CommandLine))."
+
+        # Encerra descendentes do orfao primeiro.
+        # P6.2: Revalidar identidade da raiz orfa antes de usar seu PID como referencia de parentesco.
+        $script:ExpectedProcessIdentity[$managedPid] = @{
+            CreateTime = $ct
+            Executable = $regExe
+            SessionId  = $entry.SessionId
+        }
+        $rootOk = Test-ProcessIdentity -ProcessId $managedPid
+        if (-not $rootOk) {
+            Write-AppLog 'DIAG' "Raiz orfa PID $managedPid nao revalidada; pulando arvore inteira."
+            continue
+        }
+
+        # Obter todos os descendentes e montar mapa pai->filho via WMI.
+        $allDesc = Get-DescendantProcessesRecursive -RootPid $managedPid
+        $parentMap = New-Object System.Collections.Generic.HashSet[string]
+        $pidCreateTime = New-Object System.Collections.Hashtable
+        $pidSessionId = New-Object System.Collections.Hashtable
+        $pidExecutable = New-Object System.Collections.Hashtable
+        $pidCreateTime[$managedPid] = $ct
+        $pidSessionId[$managedPid] = $entry.SessionId
+        $pidExecutable[$managedPid] = $regExe
+
+        foreach ($d in $allDesc) {
+            try {
+                $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($d.Id)" -ErrorAction SilentlyContinue
+                if ($null -ne $wmi) {
+                    $parentMap.Add("$($d.Id)|$([int]$wmi.ParentProcessId)") | Out-Null
+                    $pidCreateTime[$d.Id] = $d.StartTime
+                    $pidSessionId[$d.Id] = [string]$wmi.SessionId
+                    $pidExecutable[$d.Id] = $d.Path
+                }
+            } catch { }
+        }
+
+        # P6.1: Ordem bottom-up (filhos antes de pais).
+        $bottomUp = New-Object System.Collections.Generic.List[int]
+        $processed = New-Object System.Collections.Generic.HashSet[int]
+        $remaining = New-Object System.Collections.Generic.List[int]
+        foreach ($d in $allDesc) { $remaining.Add($d.Id) }
+
+        while ($remaining.Count -gt 0) {
+            $progress = $false
+            $nextRemaining = New-Object System.Collections.Generic.List[int]
+            foreach ($procId in $remaining) {
+                $pidStr = [string]$procId
+                $parentPid = $null
+                foreach ($entryMap in $parentMap) {
+                    $parts = $entryMap.Split('|')
+                    if ($parts[0] -eq $pidStr) { $parentPid = [int]$parts[1]; break }
+                }
+                if ($null -ne $parentPid -and ($parentPid -eq $managedPid -or $processed.Contains($parentPid))) {
+                    $bottomUp.Add($procId) | Out-Null
+                    $processed.Add($procId) | Out-Null
+                    $progress = $true
+                } else {
+                    $nextRemaining.Add($procId)
+                }
+            }
+            if (-not $progress) { break }
+            $remaining = $nextRemaining
+        }
+
+        $validatedPids = New-Object System.Collections.Generic.HashSet[int]
+        $validatedPids.Add($managedPid) | Out-Null
+
+        foreach ($procId in $bottomUp) {
+            $parentPid = $null
+            foreach ($entryMap in $parentMap) {
+                $parts = $entryMap.Split('|')
+                if ($parts[0] -eq [string]$procId) { $parentPid = [int]$parts[1]; break }
+            }
+            if ($null -eq $parentPid -or -not $validatedPids.Contains($parentPid)) {
+                Write-AppLog 'DIAG' "PID $procId nao possui pai imediato validado na arvore; pulando ramo."
+                continue
+            }
+
+            $expCt = $pidCreateTime[$procId]
+            $expExe = $pidExecutable[$procId]
+            $expSess = $pidSessionId[$procId]
+            if ([string]::IsNullOrWhiteSpace($expSess)) { $expSess = $entry.SessionId }
+
+            # Definir metadados esperados para revalidacao dentro de Stop-IndividualProcess.
+            $script:ExpectedProcessIdentity[$procId] = @{
+                CreateTime = $expCt
+                Executable = $expExe
+                SessionId  = $expSess
+            }
+
+            if (-not (Test-ProcessIdentity -ProcessId $procId)) {
+                Write-AppLog 'DIAG' "PID $procId identidade divergente na validacao de arvore; pulando ramo."
+                continue
+            }
+
+            $parentCt = $pidCreateTime[$parentPid]
+            $dp = Get-Process -Id $procId -ErrorAction SilentlyContinue
+            if ($null -eq $dp) { continue }
+            if ($dp.StartTime -lt $parentCt) {
+                Write-AppLog 'DIAG' "PID $procId anterior ao pai $parentPid; possivel reuso de PID; pulando."
+                continue
+            }
+
+            $validatedPids.Add($procId) | Out-Null
+
+            # P6.3: Stop-IndividualProcess revalida internamente (le $script:ExpectedProcessIdentity).
+            if (Stop-IndividualProcess -Process $dp -WaitMs 3000) {
+                $stoppedCount++
+            } else {
+                $stoppedFail++; $failedPids += $procId
+            }
+        }
+
+        # Encerra o orfao (raiz da sessao anterior).
+        if (Stop-IndividualProcess -Process $entry.Process -WaitMs 5000) { $stoppedCount++ }
+        else { $stoppedFail++; $failedPids += $managedPid }
+    }
+
+    # ------------------------------------------------------------------
+    # 3. Verificacao real de término
+    # ------------------------------------------------------------------
+    Start-Sleep -Milliseconds 1500
+    $trueFailures = @()
+    foreach ($processId in @($failedPids)) {
+        try {
+            $p = Get-Process -Id $processId -ErrorAction Stop
+            $trueFailures += $processId
+            Write-AppLog 'WARN' "FALHA ao encerrar PID $processId ($($p.ProcessName)) - processo ainda em execução apos todas as tentativas."
+        } catch {
+            # Nao existe mais: foi encerrado.
+            $stoppedCount++
+            $stoppedFail--
+            Write-AppLog 'OK' "PID $processId confirmado encerrado na verificacao de termino."
         }
     }
-    $script:AiManagedPids = @()
-    Write-AppLog 'OK' "$count processo(s) gerenciado(s) encerrado(s)."
-    return $count
+
+    # Libera o rastreamento apenas apos a verificacao de término.
+    $global:AiManagedPids.Clear()
+    $global:AiManagedProcessMeta.Clear()
+    $global:AiProcessTree.Clear()
+    # Remove o registro persistente da sessao atual (ja encerrada).
+    try {
+        if (Test-Path -LiteralPath $script:AiRegisteredProcessesFile -PathType Leaf) {
+            [System.IO.File]::Delete($script:AiRegisteredProcessesFile)
+        }
+    } catch {
+        Write-AppLog 'WARN' "Nao foi possível remover o registro persistente apos a parada: $($_.Exception.Message)"
+    }
+
+    $failedList = if ($trueFailures.Count -gt 0) { ($trueFailures -join ', ') } else { 'nenhum' }
+    Write-AppLog 'OK' "Parada concluída: $stoppedCount processo(s) encerrado(s); $($trueFailures.Count) falha(s). PIDs que não puderam ser encerrados: $failedList"
+    return $stoppedCount
+}
+
+# ------------------------------------------------------------------------------
+# CONTAGEM DE HERMES GERENCIADO PELA SESSAO ATUAL
+# ------------------------------------------------------------------------------
+# Retorna os processos Hermes (hermes.exe ou python.exe com headroom.cli wrap
+# hermes) que pertencem à arvore da sessao atual do AmbienteIA. E' a unica
+# fonte de verdade para o status RUNNING na interface: nunca usa varredura
+# global de hermes.exe/python.exe do sistema.
+function Get-ManagedHermesProcesses {
+    $hermes = @()
+    # Fonte de verdade: registro de metadados da sessao atual (nao varredura global do SO).
+    foreach ($managedPid in @($global:AiManagedPids)) {
+        # Valida propriedade da sessao atual antes de considerar o processo.
+        if (-not (Test-ProcessBelongsToCurrentSession -ProcessId $managedPid)) { continue }
+        try {
+            $p = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
+            if ($null -eq $p) { continue }
+            $name = $p.ProcessName
+            $cmd  = [string]$p.CommandLine
+            if ($name -eq 'hermes' -or ($name -like 'python*' -and $cmd -like '*headroom.cli*wrap*hermes*')) {
+                $hermes += $p
+            }
+        } catch { }
+    }
+    return $hermes
 }
 
 # ------------------------------------------------------------------------------
@@ -755,6 +1591,9 @@ function Start-AiEnvironment {
         if (Test-AdminContext) {
             Write-AppLog 'WARN' 'O aplicativo esta rodando como administrador. Isso nao e necessario nem recomendado.'
         }
+
+        # Preparar variaveis de ambiente (credenciais do .env, HERMES_HOME, etc.)
+        Set-AiEnvironmentVariables
 
         Write-AppLog 'INFO' 'Inicializando Headroom...'
         if (-not (Test-True (Start-HeadroomStep))) {
@@ -916,7 +1755,7 @@ function Invoke-AiDiagnostics {
         if ($s.EnvFound) { & $note 'OK' ".env encontrado: $($s.EnvPath)" }
         else { & $note 'WARN' ".env não encontrado: $($s.EnvPath). | Solução: Crie o .env com NVIDIA_API_KEY." }
 
-        $hm = @(Get-HermesProcess)
+        $hm = @(Get-ManagedHermesProcesses)
         if ($hm.Count -gt 0) { & $note 'OK' "Hermes em execução ($($hm.Count) processo(s))." }
         else { Write-AppLog 'INFO' 'Hermes não está em execução.' }
 

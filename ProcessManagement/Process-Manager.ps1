@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
     Gerenciamento de processos iniciados pelo AmbienteIA.
     Funcoes para listar, encerrar e evitar processos duplicados.
@@ -7,7 +7,17 @@ param([switch]$List, [switch]$Stop)
 
 $ErrorActionPreference = 'Stop'
 
-$root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+# Resolve a raiz do projeto (pasta que contem Core\Ambiente-IA.Core.ps1).
+# Os scripts deste modulo ficam em subpastas (ProcessManagement/, Monitoramento/),
+# entao $PSScriptRoot sozinho nao alcança o Core. Sobe um nivel se necessario.
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$root = $scriptRoot
+if (-not (Test-Path -LiteralPath (Join-Path $root 'Core\Ambiente-IA.Core.ps1') -PathType Leaf)) {
+    $candidate = Split-Path -Parent $scriptRoot
+    if (Test-Path -LiteralPath (Join-Path $candidate 'Core\Ambiente-IA.Core.ps1') -PathType Leaf) {
+        $root = $candidate
+    }
+}
 $core = Join-Path $root 'Core\Ambiente-IA.Core.ps1'
 if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
     Write-Host "[ERRO] Ambiente-IA.Core.ps1 nao encontrado em: $root" -ForegroundColor Red

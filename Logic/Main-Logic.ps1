@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
     AMBIENTEIA - janela grafica (PowerShell + WPF)
     Hermes -> Headroom -> NVIDIA NIM
@@ -21,6 +21,9 @@ $script:Job       = $null
 $script:Poller    = $null
 $script:StatsJob  = $null
 $script:Mutex     = $null
+# Bloqueio atomico para lancamentos de Hermes (INICIAR AMBIENTE e ABRIR HERMES
+# compartilham o mesmo mecanismo), evitando duas instancias simultaneas.
+$script:HermesLaunchInProgress = $false
 $script:LastDot   = @{}
 $script:ErrorHistory = @()
 $script:ActivityHistory = @()
@@ -205,6 +208,9 @@ function Get-ViewModel {
 
 function Add-TickDebug {
     param([string]$Stage)
+    # Desligado por producao para evitar crescimento ilimitado do tick-debug.log.
+    # Ativar temporariamente definindo $script:TickDebugEnabled = $true antes de iniciar o timer.
+    if (-not $script:TickDebugEnabled) { return }
     try {
         [System.IO.File]::AppendAllText((Join-Path $script:LogsDir 'tick-debug.log'), ("[{0}] {1}`r`n" -f (Get-Date).ToString('HH:mm:ss.fff'), $Stage), (New-Object System.Text.UTF8Encoding($false)))
     } catch { }
@@ -322,6 +328,13 @@ function New-BackgroundRunspace {
     $rs.SessionStateProxy.SetVariable('AiState', $global:AiState)
     $rs.SessionStateProxy.SetVariable('AiLogFile', $global:AiLogFile)
     $rs.SessionStateProxy.SetVariable('AiRoot', $script:Root)
+    # Estruturas compartilhadas entre runspaces (mesma instancia, nao copia).
+    # Essenciais para que o background runspace veja o registro de processos
+    # da sessao atual e grave no mesmo registro persistente.
+    $rs.SessionStateProxy.SetVariable('AiManagedPids', $global:AiManagedPids)
+    $rs.SessionStateProxy.SetVariable('AiManagedProcessMeta', $global:AiManagedProcessMeta)
+    $rs.SessionStateProxy.SetVariable('AiProcessTree', $global:AiProcessTree)
+    $rs.SessionStateProxy.SetVariable('AiSessionId', $global:AiSessionId)
     return $rs
 }
 
@@ -381,7 +394,7 @@ while (-not $AiState['StopPolling']) {
         $AiState['ReadyzStatus']    = [int]$hh.ReadyzStatus
         $AiState['UpstreamStatus']  = [string]$hh.UpstreamStatus
         $AiState['HeadroomVersion'] = [string]$hh.Version
-        $AiState['HermesCount']     = [int]@(Get-HermesProcess).Count
+        $AiState['HermesCount']     = [int]@(Get-ManagedHermesProcesses).Count
         $AiState['Polled']          = $true
     } catch { }
     Start-Sleep -Milliseconds 2500
@@ -404,6 +417,10 @@ function Invoke-UiTick {
 
         if ($null -ne $script:Job -and $script:Job.Handle.IsCompleted) {
             Complete-Job
+            # Libera o bloqueio atomico de lancamento de Hermes apos o job concluir,
+            # independentemente do Kind (start ou hermes), permitindo um novo lancamento.
+            $script:HermesLaunchInProgress = $false
+            $script:Job = $null
         }
 
         Update-View
@@ -516,7 +533,26 @@ try {
     $script:ui.LogBox.Document.Blocks.Clear()
 
     $script:ui.StartButton.Add_Click({
-        Start-BackgroundWork -Kind 'start' -Command 'Start-AiEnvironment'
+        # Protecao atomica compartilhada com ABRIR HERMES.
+        if ($script:HermesLaunchInProgress) {
+            Write-AppLog 'WARN' 'Um Hermes ja esta sendo iniciado. Aguarde e tente novamente.'
+            return
+        }
+        $script:HermesLaunchInProgress = $true
+        $jobAntes = $script:Job
+        try {
+            Start-BackgroundWork -Kind 'start' -Command 'Start-AiEnvironment'
+            # Se Start-BackgroundWork rejeitou (ja havia um job em andamento),
+            # nao houve job novo: libera o bloqueio imediatamente.
+            if ($jobAntes -eq $script:Job) {
+                $script:HermesLaunchInProgress = $false
+            }
+        } catch {
+            Write-AppLog 'ERROR' "Falha ao iniciar o ambiente: $($_.Exception.Message)"
+            $script:HermesLaunchInProgress = $false
+        }
+        # Nota: se o job foi criado com sucesso, o bloqueio e liberado por
+        # Invoke-UiTick quando o job completar (qualquer Kind).
     })
     $script:ui.StopButton.Add_Click({
         if ($null -ne $script:Job) {
@@ -529,11 +565,30 @@ try {
         Update-View
     })
     $script:ui.OpenHermesButton.Add_Click({
+        # Protecao atomica: nao permite lancamento duplo de Hermes.
+        if ($script:HermesLaunchInProgress) {
+            Write-AppLog 'WARN' 'Um Hermes ja esta sendo iniciado. Aguarde e tente novamente.'
+            return
+        }
         if ($global:AiState['HermesCount'] -gt 0) {
             $ans = [System.Windows.MessageBox]::Show('Já existe um Hermes em execução. Abrir outra janela?', 'AmbienteIA', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
             if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
         }
-        Start-BackgroundWork -Kind 'hermes' -Command 'Open-HermesOnly'
+        $script:HermesLaunchInProgress = $true
+        $jobAntes = $script:Job
+        try {
+            Start-BackgroundWork -Kind 'hermes' -Command 'Open-HermesOnly'
+            # Se Start-BackgroundWork rejeitou (ja havia um job em andamento),
+            # nao houve job novo: libera o bloqueio imediatamente.
+            if ($jobAntes -eq $script:Job) {
+                $script:HermesLaunchInProgress = $false
+            }
+        } catch {
+            Write-AppLog 'ERROR' "Falha ao abrir o Hermes: $($_.Exception.Message)"
+            $script:HermesLaunchInProgress = $false
+        }
+        # Nota: se o job foi criado com sucesso, o bloqueio e liberado por
+        # Invoke-UiTick quando o job completar (qualquer Kind), veja linha ~411.
     })
     $script:ui.OpenFolderButton.Add_Click({
         $dir = $global:AiCfg.HermesWorkDir
@@ -572,15 +627,60 @@ try {
             Write-AppLog 'ERROR' "Config não encontrado: $cfg"
         }
     })
-    $script:ui.ExitButton.Add_Click({ $script:Window.Close() })
+    $script:ui.ExitButton.Add_Click({
+        # Antes de fechar a interface, encerra os serviços iniciados pelo AmbienteIA
+        # (Headroom e Hermes) para não deixar processos órfãos.
+        $running = @(Get-ManagedProcesses)
+        $orphanTitles = @('HEADROOM - PROXY', 'HERMES - PROJETOS')
+        $orphanProcs = Find-ProcessesByWindowTitle -TitleTerms $orphanTitles
+        $hasServices = ($running.Count -gt 0) -or ($orphanProcs.Count -gt 0)
+
+        if ($hasServices) {
+            $ans = [System.Windows.MessageBox]::Show(
+                "Isso encerrará a interface e também parará os serviços do AmbienteIA (Headroom e Hermes). Deseja continuar?",
+                'AmbienteIA',
+                [System.Windows.MessageBoxButton]::YesNo,
+                [System.Windows.MessageBoxImage]::Question)
+            if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
+        }
+
+        Write-AppLog 'INFO' 'Encerrando ambiente antes de fechar a interface...'
+        $stopped = Stop-AiEnvironment
+        Add-Activity -Level 'INFO' -Message "$stopped processo(s) encerrado(s) antes de fechar a interface."
+        $script:Window.Close()
+    })
 
     $window.Add_SourceInitialized({ Set-DarkTitleBar $script:Window })
 
     $window.Add_Closing({
         param($sender, $e)
+        # Se houver operação em andamento, pergunta ao usuário
         if ($null -ne $script:Job) {
             $ans = [System.Windows.MessageBox]::Show("Há uma operação em andamento. Fechar a interface agora?`n`nOs serviços já iniciados continuam rodando.", 'AmbienteIA', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
             if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { $e.Cancel = $true }
+        }
+
+        # Se não foi cancelado, encerra os serviços do AmbienteIA (Headroom/Hermes)
+        # antes de permitir o fechamento da janela.
+        if (-not $e.Cancel) {
+            $running = @(Get-ManagedProcesses)
+            $orphanTitles = @('HEADROOM - PROXY', 'HERMES - PROJETOS')
+            $orphanProcs = Find-ProcessesByWindowTitle -TitleTerms $orphanTitles
+            $hasServices = ($running.Count -gt 0) -or ($orphanProcs.Count -gt 0)
+
+            if ($hasServices) {
+                $ans = [System.Windows.MessageBox]::Show(
+                    "Isso encerrará os serviços do AmbienteIA (Headroom e Hermes) antes de fechar a interface. Deseja continuar?",
+                    'AmbienteIA',
+                    [System.Windows.MessageBoxButton]::YesNo,
+                    [System.Windows.MessageBoxImage]::Question)
+                if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { $e.Cancel = $true }
+                else {
+                    Write-AppLog 'INFO' 'Encerrando ambiente antes de fechar a janela...'
+                    $stopped = Stop-AiEnvironment
+                    Add-Activity -Level 'INFO' -Message "$stopped processo(s) encerrado(s) antes de fechar a janela."
+                }
+            }
         }
     })
 

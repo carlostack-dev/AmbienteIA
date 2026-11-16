@@ -432,7 +432,7 @@
           </StackPanel>
         </Button>
         <Button x:Name="ExitButton" Style="{StaticResource SecondaryButton}" MinWidth="170"
-                ToolTip="Fecha apenas esta interface. Os serviços continuam rodando.">
+                ToolTip="Fecha a interface e encerra os serviços do AmbienteIA (Headroom e Hermes).">
           <StackPanel Orientation="Horizontal">
             <TextBlock Style="{StaticResource GlyphText}" Text="&#xE7E8;"/>
             <TextBlock Text="ENCERRAR INTERFACE" VerticalAlignment="Center"/>
